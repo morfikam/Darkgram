@@ -1,0 +1,93 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Check secrets
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
+            echo "::error::Добавьте секреты TELEGRAM_API_ID и TELEGRAM_API_HASH (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Select Xcode
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          echo "Нужен Xcode $XCODE_VERSION"
+          ls -d /Applications/Xcode*.app || true
+          if [ -d "/Applications/Xcode_$XCODE_VERSION.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_$XCODE_VERSION.app/Contents/Developer"
+            echo "XCODE_OVERRIDE=" >> $GITHUB_ENV
+          else
+            echo "::warning::Xcode $XCODE_VERSION не найден, используется Xcode по умолчанию"
+            echo "XCODE_OVERRIDE=--overrideXcodeVersion" >> $GITHUB_ENV
+          fi
+          xcodebuild -version
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /Applications/Xcode_1[0-5]*.app ~/Library/Android /usr/local/share/dotnet || true
+          df -h /
+
+      - name: Prepare source dir
+        run: |
+          sudo mkdir -p /Users/Shared
+          sudo chown $(whoami) /Users/Shared
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+
+      - name: Patch configuration (api_id / api_hash)
+        working-directory: /Users/Shared/telegram-ios
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          src = "build-system/appstore-configuration.json"
+          cfg = json.load(open(src))
+          api_id = os.environ["API_ID"].strip()
+          cfg["api_id"] = int(api_id) if isinstance(cfg.get("api_id"), int) else api_id
+          cfg["api_hash"] = os.environ["API_HASH"]
+          json.dump(cfg, open("build-system/ci-configuration.json", "w"), indent=2)
+          print("Ключи конфигурации:", sorted(cfg.keys()))
+          EOF
+
+      - name: Build
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -x
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
+          BUILD_NUMBER=$(( $(git rev-list --count HEAD) + BUILD_NUMBER_OFFSET ))
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot=/private/var/tmp/_bazel_ci \
+            $XCODE_OVERRIDE \
+            build \
+            --configurationPath=build-system/ci-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber=$BUILD_NUMBER \
+            --outputBuildArtifactsPath=/Users/Shared/telegram-ios/build/artifacts
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Darkgram-ipa
+          path: /Users/Shared/telegram-ios/build/artifacts/*.ipa
+          if-no-files-found: error
